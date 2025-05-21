@@ -10,7 +10,7 @@ object SettingsManager {
 
     // Default refresh interval in minutes. 0 means disabled.
     const val DEFAULT_REFRESH_INTERVAL_MINUTES = 0
-    val REFRESH_INTERVAL_OPTIONS = listOf(0, 15, 30, 60) // 0 for Disabled
+    val REFRESH_INTERVAL_OPTIONS = listOf(0, 15, 30, 60)
 
     private fun getPreferences(context: Context): SharedPreferences {
         return context.getSharedPreferences(PREFERENCES_FILE_KEY, Context.MODE_PRIVATE)

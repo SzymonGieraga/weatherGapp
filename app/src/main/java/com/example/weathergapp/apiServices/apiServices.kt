@@ -20,9 +20,6 @@ import org.json.JSONObject
 class apiServices(private val context: Context) {
 
     var appKey = BuildConfig.API_KEY
-    // Ensure your BuildConfig has API_KEY defined, or replace BuildConfig.API_KEY with your actual key string for testing.
-    // For example: var appKey = "YOUR_ACTUAL_API_KEY"
-
     val apiUrl = "https://api.openweathermap.org/"
 
     interface ResponseCallback {
@@ -38,13 +35,9 @@ class apiServices(private val context: Context) {
         makeRequest(url, callback)
     }
 
-    // Note: OpenWeatherMap's /data/2.5/forecast endpoint provides 3-hour step forecasts.
-    // If you need 1-hour step forecasts, you'd typically use the "One Call API" (paid or with limitations).
-    // This function, as is, will fetch the same data as getForecastData.
+
     fun getHourlyData(lat: Double, lon: Double, unit: String, callback: ResponseCallback) {
         val unitsParam = determineUnitsParameter(unit)
-        // Using the same endpoint as forecast for now, as per original code.
-        // For true distinct hourly data, a different endpoint or API version might be needed.
         val url = "${apiUrl}data/2.5/forecast?lat=$lat&lon=$lon&appid=$appKey&$unitsParam"
         Log.d("apiServices", "Requesting Hourly (Forecast) URL: $url")
         makeRequest(url, callback)
@@ -53,10 +46,10 @@ class apiServices(private val context: Context) {
     // Fetches current weather data
     fun getData(userInputs: String, unit: String, callback: ResponseCallback) {
         if (isNetworkAvailable()) {
-            var url = createURL(userInputs) // This already includes appid
+            var url = createURL(userInputs)
             if (url != null) {
                 val unitsParam = determineUnitsParameter(unit)
-                url = "$url&$unitsParam" // Append units parameter
+                url = "$url&$unitsParam"
                 Log.d("apiServices", "Requesting Current Weather URL: $url")
                 makeRequest(url, callback)
             } else {
@@ -75,9 +68,7 @@ class apiServices(private val context: Context) {
                 response.use {
                     if (it.isSuccessful) {
                         it.body?.string()?.let { responseBody ->
-                            // Removed: WeatherDataRepo.setWeatherDataJson(jsonObj)
-                            // The responsibility to set data in the repo is moved to the
-                            // specific callbacks in MainActivity, based on what data was fetched.
+
                             callback.onSuccess(responseBody)
                         } ?: callback.onFailure(IOException("Response body is null"))
                     } else {
@@ -134,7 +125,6 @@ class apiServices(private val context: Context) {
         }
     }
 
-    // This function was not used by createURL for adding units, so I've made it return the parameter string
     private fun determineUnitsParameter(unitPreference: String): String {
         return when (unitPreference) {
             "°C" -> "units=metric"
@@ -143,12 +133,6 @@ class apiServices(private val context: Context) {
         }
     }
 
-    // isUserInputValid was not used in the provided getData logic, createURL handles validation.
-    // If you need it, ensure its logic aligns with createURL.
-    // private fun isUserInputValid(userInputs: String): Boolean { ... }
-
-
-    // File operations - these seem okay but are not directly related to the crash.
     fun saveWeatherDataToFile(filename: String, weatherData: String) {
         context.openFileOutput(filename, Context.MODE_PRIVATE).use {
             it.write(weatherData.toByteArray())
@@ -198,7 +182,7 @@ class apiServices(private val context: Context) {
             } else {
                 mutableListOf()
             }
-        } catch (e: Exception) { // Catch broader exceptions for deserialization issues
+        } catch (e: Exception) {
             Log.e("apiServices", "Error loading favorites from file", e)
             mutableListOf()
         }
