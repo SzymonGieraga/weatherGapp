@@ -7,6 +7,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
@@ -21,23 +22,26 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import com.example.weathergapp.apiServices.WeatherDataRepo
 import com.example.weathergapp.apiServices.apiServices
 import java.io.IOException
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import org.json.JSONException
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.math.roundToInt
 
-// Data classes for UI states
+// Data classes for UI states (assuming these are defined as before)
 data class CurrentWeatherUIState(
     val locationName: String = "N/A",
     val coordinates: String = "Lat: N/A, Lon: N/A",
@@ -75,12 +79,16 @@ data class ForecastUIState(
 class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
 
     private lateinit var apiService: apiServices
-    private var userInputLocation by mutableStateOf("London") // Default location for initial load
+    private var userInputLocation by mutableStateOf("London")
     private var currentWeatherDataState by mutableStateOf(CurrentWeatherUIState())
     private var forecastDataState by mutableStateOf(ForecastUIState())
-    private var loadingState by mutableStateOf(false) // Overall loading for initial fetch trigger
-    private var errorMessage by mutableStateOf<String?>(null) // General error message
+    private var общийLoadingState by mutableStateOf(false) // Renamed to avoid conflict if 'loadingState' is used elsewhere
+    private var errorMessage by mutableStateOf<String?>(null)
     private var selectedUnit by mutableStateOf("°C")
+
+    private var showSettingsDialog by mutableStateOf(false)
+    private var autoRefreshIntervalMinutes by mutableStateOf(SettingsManager.DEFAULT_REFRESH_INTERVAL_MINUTES)
+
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -88,7 +96,8 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
         apiService = apiServices(this)
         WeatherDataRepo.registerWeatherObserver(this)
         WeatherDataRepo.registerForecastObserver(this)
-        // No separate hourly observer needed if using forecast data for it
+
+        autoRefreshIntervalMinutes = SettingsManager.loadRefreshInterval(this)
 
         if (DataManager.unit.isNotBlank()) {
             selectedUnit = DataManager.unit
@@ -101,19 +110,35 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
                 val oldUnit = selectedUnit
                 selectedUnit = newUnit
                 if (oldUnit != newUnit && userInputLocation.isNotEmpty() && !currentWeatherDataState.isLoading) {
-                    fetchWeatherData(userInputLocation)
+                    fetchWeatherData(userInputLocation, isManualRefresh = true)
                 }
             }
         })
 
-        // Fetch weather for default location on initial create
-        if (currentWeatherDataState.isLoading) { // Only fetch if not already loaded (e.g. on config change)
-            fetchWeatherData(userInputLocation)
+        if (currentWeatherDataState.isLoading) {
+            fetchWeatherData(userInputLocation, isManualRefresh = false) // Initial fetch
         }
-
 
         setContent {
             WeatherAppScreen()
+
+            // Auto-refresh logic
+            val lifecycleOwner = LocalLifecycleOwner.current
+            LaunchedEffect(autoRefreshIntervalMinutes, userInputLocation, lifecycleOwner) {
+                if (autoRefreshIntervalMinutes > 0) {
+                    lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                        while (isActive) {
+                            Log.d("AutoRefresh", "Delaying for $autoRefreshIntervalMinutes minutes.")
+                            delay(autoRefreshIntervalMinutes * 60 * 1000L)
+                            // Check isActive again before fetching, in case the coroutine was cancelled during delay
+                            if (isActive) {
+                                Log.d("AutoRefresh", "Interval elapsed, fetching weather data for $userInputLocation")
+                                fetchWeatherData(userInputLocation, isManualRefresh = false)
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -152,101 +177,93 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
             }
         }
     }
-    override fun onHourlyDataUpdated() { /* Not used directly if hourly is part of forecast */ }
 
+    override fun onHourlyDataUpdated() { /* Not used */ }
 
-    private fun fetchWeatherData(location: String) {
+    private fun fetchWeatherData(location: String, isManualRefresh: Boolean) {
         if (location.isBlank()) {
-            errorMessage = "Please enter a location."
+            runOnUiThread { // Ensure Toast is on UI thread
+                errorMessage = "Please enter a location."
+                if (isManualRefresh) Toast.makeText(this, errorMessage, Toast.LENGTH_SHORT).show()
+            }
             return
         }
-        Log.d("MainActivity", "Fetching weather for: $location, Unit: $selectedUnit")
-        loadingState = true
+        Log.d("MainActivity", "Fetching weather for: $location, Unit: $selectedUnit, Manual: $isManualRefresh")
+        общийLoadingState = true
         errorMessage = null
-        currentWeatherDataState = CurrentWeatherUIState(isLoading = true) // Reset to loading
-        forecastDataState = ForecastUIState(isLoading = true)     // Reset to loading
-
+        currentWeatherDataState = CurrentWeatherUIState(isLoading = true)
+        forecastDataState = ForecastUIState(isLoading = true)
 
         apiService.getData(location, selectedUnit, object : apiServices.ResponseCallback {
             override fun onSuccess(result: String) {
                 try {
                     val json = JSONObject(result)
-                    Log.d("MainActivity", "Current weather API raw success: $result")
-                    WeatherDataRepo.setWeatherDataJson(json) // This will trigger onWeatherDataUpdated
-
+                    WeatherDataRepo.setWeatherDataJson(json)
                     val coord = json.optJSONObject("coord")
                     if (coord != null) {
-                        val lat = coord.getDouble("lat")
-                        val lon = coord.getDouble("lon")
-                        fetchForecastData(lat, lon) // Fetch forecast after current weather
+                        fetchForecastData(coord.getDouble("lat"), coord.getDouble("lon"), isManualRefresh)
                     } else {
-                        Log.e("MainActivity", "Coordinates not found in current weather response.")
-                        runOnUiThread {
-                            errorMessage = "Could not get coordinates for forecast."
-                            loadingState = false
-                            currentWeatherDataState = currentWeatherDataState.copy(isLoading = false, error = "Coordinates missing.")
-                            forecastDataState = forecastDataState.copy(isLoading = false, error = "Could not fetch: Coordinates missing.")
-                        }
+                        handleFetchError("Coordinates not found.", isManualRefresh)
                     }
                 } catch (e: JSONException) {
-                    Log.e("MainActivity", "Error parsing current weather JSON: $result", e)
-                    runOnUiThread {
-                        errorMessage = "Error parsing current weather data: ${e.message}"
-                        loadingState = false
-                        currentWeatherDataState = currentWeatherDataState.copy(isLoading = false, error = e.message)
-                    }
+                    Log.e("MainActivity", "Error parsing current weather JSON", e)
+                    handleFetchError("Error parsing current weather: ${e.message}", isManualRefresh)
                 }
             }
 
             override fun onFailure(e: IOException?) {
-                Log.e("MainActivity", "Failed to fetch current weather data", e)
-                runOnUiThread {
-                    val errorMsg = "API Error: ${e?.message ?: "Unknown error"}"
-                    errorMessage = errorMsg
-                    loadingState = false
-                    currentWeatherDataState = currentWeatherDataState.copy(isLoading = false, error = errorMsg)
-                    forecastDataState = forecastDataState.copy(isLoading = false, error = errorMsg) // Also mark forecast as error
-                    Toast.makeText(this@MainActivity, errorMsg, Toast.LENGTH_LONG).show()
-                }
+                Log.e("MainActivity", "Failed to fetch current weather", e)
+                handleFetchError("API Error: ${e?.message ?: "Unknown error"}", isManualRefresh)
             }
         })
     }
 
-    private fun fetchForecastData(lat: Double, lon: Double) {
+    private fun fetchForecastData(lat: Double, lon: Double, isManualRefresh: Boolean) {
         apiService.getForecastData(lat, lon, selectedUnit, object : apiServices.ResponseCallback {
             override fun onSuccess(result: String) {
                 try {
-                    val json = JSONObject(result)
-                    Log.d("MainActivity", "Forecast data API raw success: $result")
-                    WeatherDataRepo.setForecastDataJson(json) // This triggers onForecastDataUpdated
+                    WeatherDataRepo.setForecastDataJson(JSONObject(result))
+                    if (isManualRefresh) {
+                        runOnUiThread { // Ensure Toast is on UI thread
+                            Toast.makeText(this@MainActivity, "Weather data refreshed!", Toast.LENGTH_SHORT).show()
+                        }
+                    }
                 } catch (e: JSONException) {
-                    Log.e("MainActivity", "Error parsing forecast JSON: $result", e)
-                    runOnUiThread {
-                        errorMessage = "Error parsing forecast data: ${e.message}"
-                        forecastDataState = forecastDataState.copy(isLoading = false, error = e.message)
-                    }
+                    Log.e("MainActivity", "Error parsing forecast JSON", e)
+                    handleFetchError("Error parsing forecast: ${e.message}", isManualRefresh, isForecast = true)
                 } finally {
-                    runOnUiThread {
-                        loadingState = false // All data fetching attempts are complete
-                    }
+                    runOnUiThread { общийLoadingState = false }
                 }
             }
 
             override fun onFailure(e: IOException?) {
-                Log.e("MainActivity", "Failed to fetch forecast data", e)
-                runOnUiThread {
-                    val errorMsg = "API Error (Forecast): ${e?.message ?: "Unknown error"}"
-                    errorMessage = errorMsg
-                    loadingState = false
-                    forecastDataState = forecastDataState.copy(isLoading = false, error = errorMsg)
-                    Toast.makeText(this@MainActivity, errorMsg, Toast.LENGTH_LONG).show()
-                }
+                Log.e("MainActivity", "Failed to fetch forecast", e)
+                handleFetchError("API Error (Forecast): ${e?.message ?: "Unknown error"}", isManualRefresh, isForecast = true)
             }
         })
     }
 
+    private fun handleFetchError(errorMsg: String, isManualRefresh: Boolean, isForecast: Boolean = false) {
+        runOnUiThread { // This function is already called on UI thread or wraps its content in runOnUiThread
+            errorMessage = errorMsg
+            общийLoadingState = false
+            if (isForecast) {
+                forecastDataState = forecastDataState.copy(isLoading = false, error = errorMsg)
+            } else {
+                currentWeatherDataState = currentWeatherDataState.copy(isLoading = false, error = errorMsg)
+                forecastDataState = forecastDataState.copy(isLoading = false, error = "Dependency error: $errorMsg") // Forecast depends on current
+            }
+            // Ensure Toast inside handleFetchError is also explicitly on UI thread,
+            // though its callers should already handle this. Better safe than sorry.
+            if (isManualRefresh || !isForecast) {
+                Toast.makeText(this@MainActivity, errorMsg, Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+
+    @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
     @Composable
-    @OptIn(ExperimentalMaterial3Api::class)
     fun WeatherAppScreen() {
         var tempUserInputLocation by remember { mutableStateOf(userInputLocation) }
 
@@ -257,7 +274,18 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
                     colors = TopAppBarDefaults.topAppBarColors(
                         containerColor = MaterialTheme.colorScheme.primaryContainer,
                         titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
-                    )
+                    ),
+                    actions = {
+                        IconButton(onClick = {
+                            Log.d("MainActivity", "Manual refresh triggered.")
+                            fetchWeatherData(userInputLocation, isManualRefresh = true)
+                        }) {
+                            Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
+                        }
+                        IconButton(onClick = { showSettingsDialog = true }) {
+                            Icon(Icons.Filled.Settings, contentDescription = "Settings")
+                        }
+                    }
                 )
             }
         ) { paddingValues ->
@@ -266,11 +294,8 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
                     .padding(paddingValues)
                     .fillMaxSize()
             ) {
-                // Input and Control Row
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
@@ -284,14 +309,13 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
                     Button(
                         onClick = {
                             userInputLocation = tempUserInputLocation
-                            fetchWeatherData(userInputLocation)
+                            fetchWeatherData(userInputLocation, isManualRefresh = true)
                         },
-                        enabled = !loadingState
+                        enabled = !общийLoadingState
                     ) {
                         Icon(Icons.Filled.Search, contentDescription = "Search")
                     }
                 }
-                // Unit Selector
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).fillMaxWidth(),
@@ -308,55 +332,38 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
                     }
                 }
 
-
-                if (loadingState && currentWeatherDataState.isLoading && forecastDataState.isLoading) {
+                if (общийLoadingState && currentWeatherDataState.isLoading && forecastDataState.isLoading && errorMessage == null) {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         CircularProgressIndicator()
                     }
-                } else if (errorMessage != null && currentWeatherDataState.error != null) {
+                } else if (errorMessage != null) {
                     Box(modifier = Modifier.fillMaxSize().padding(16.dp), contentAlignment = Alignment.Center) {
                         Text("Error: $errorMessage", color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center)
                     }
-                }
-                else {
+                } else {
                     BoxWithConstraints {
-                        val screenWidth = this.maxWidth
-                        if (screenWidth < 600.dp) {
-                            // Small screen: Pager
+                        if (this.maxWidth < 600.dp) {
                             val pagerState = rememberPagerState(pageCount = { 3 })
                             Column {
-                                HorizontalPager(
-                                    state = pagerState,
-                                    modifier = Modifier.weight(1f)
-                                ) { page ->
-                                    WeatherPage(pageIndex = page, currentWeatherDataState, forecastDataState)
+                                HorizontalPager(state = pagerState, modifier = Modifier.weight(1f)) { page ->
+                                    WeatherPage(page, currentWeatherDataState, forecastDataState)
                                 }
                                 Row(
-                                    Modifier
-                                        .height(50.dp)
-                                        .fillMaxWidth()
-                                        .padding(bottom = 8.dp),
+                                    Modifier.height(50.dp).fillMaxWidth().padding(bottom = 8.dp),
                                     horizontalArrangement = Arrangement.Center
                                 ) {
                                     repeat(pagerState.pageCount) { iteration ->
                                         val color = if (pagerState.currentPage == iteration) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.3f)
-                                        Box(
-                                            modifier = Modifier
-                                                .padding(4.dp)
-                                                .clip(CircleShape)
-                                                .size(12.dp)
-                                                .background(color)
-                                        )
+                                        Box(modifier = Modifier.padding(4.dp).clip(CircleShape).size(12.dp).background(color))
                                     }
                                 }
                             }
                         } else {
-                            // Large screen: Column
                             Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
                                 CurrentWeatherBasicInfoView(currentWeatherDataState)
-                                Spacer(modifier = Modifier.height(16.dp))
+                                Spacer(Modifier.height(16.dp))
                                 CurrentWeatherDetailedInfoView(currentWeatherDataState)
-                                Spacer(modifier = Modifier.height(16.dp))
+                                Spacer(Modifier.height(16.dp))
                                 ForecastView(forecastDataState)
                             }
                         }
@@ -364,11 +371,25 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
                 }
             }
         }
+
+        if (showSettingsDialog) {
+            SettingsDialog(
+                currentInterval = autoRefreshIntervalMinutes,
+                onDismiss = { showSettingsDialog = false },
+                onSave = { newInterval ->
+                    autoRefreshIntervalMinutes = newInterval
+                    SettingsManager.saveRefreshInterval(this, newInterval)
+                    showSettingsDialog = false
+                    runOnUiThread { // Ensure Toast is on UI thread
+                        Toast.makeText(this, "Settings saved. Auto-refresh set to $newInterval minutes (0 for disabled).", Toast.LENGTH_LONG).show()
+                    }
+                }
+            )
+        }
     }
 
     @Composable
     fun WeatherPage(pageIndex: Int, currentData: CurrentWeatherUIState, forecastData: ForecastUIState) {
-        // Use a consistent padding for all pages
         Column(modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState())) {
             when (pageIndex) {
                 0 -> CurrentWeatherBasicInfoView(data = currentData)
@@ -377,7 +398,67 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
             }
         }
     }
+
+    @Composable
+    fun SettingsDialog(
+        currentInterval: Int,
+        onDismiss: () -> Unit,
+        onSave: (Int) -> Unit
+    ) {
+        var selectedInterval by remember { mutableStateOf(currentInterval) }
+
+        Dialog(onDismissRequest = onDismiss) {
+            Card(
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.padding(16.dp)
+            ) {
+                Column(
+                    modifier = Modifier.padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text("Auto-Refresh Interval", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(bottom = 16.dp))
+                    SettingsManager.REFRESH_INTERVAL_OPTIONS.forEach { interval ->
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clickable { selectedInterval = interval }
+                                .padding(vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = (selectedInterval == interval),
+                                onClick = { selectedInterval = interval }
+                            )
+                            Text(
+                                text = if (interval == 0) "Disabled" else "$interval minutes",
+                                style = MaterialTheme.typography.bodyLarge,
+                                modifier = Modifier.padding(start = 8.dp)
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(24.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        TextButton(onClick = onDismiss) {
+                            Text("Cancel")
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(onClick = { onSave(selectedInterval) }) {
+                            Text("Save")
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
+
+
+// Helper functions (formatTime, formatDayOfWeek, formatDate, windDegreeToCardinal, getWeatherIcon) - assumed to be the same
+// Parsing functions (parseCurrentWeatherJson, parseForecastJson, Double.format) - assumed to be the same
+// Composable "Fragments" / Views (CurrentWeatherBasicInfoView, CurrentWeatherDetailedInfoView, ForecastView, ForecastItemRow, DataCard, InfoRow) - assumed to be the same
 
 // Helper function to format timestamp to human-readable time
 fun formatTime(timestamp: Long, timezoneOffset: Int, format: String = "HH:mm"): String {
@@ -484,26 +565,18 @@ fun parseForecastJson(json: JSONObject, unit: String): ForecastUIState {
         val city = json.optJSONObject("city")
         val timezoneOffset = city?.optInt("timezone", 0) ?: 0
 
-        // Group by day - Simple approach: take one forecast per day around noon or the first one.
-        // A more robust approach would iterate all, find min/max temps for each day,
-        // and a representative weather condition.
         val dailyData = mutableMapOf<String, MutableList<JSONObject>>()
 
         for (i in 0 until list.length()) {
             val item = list.getJSONObject(i)
             val dt = item.optLong("dt")
-            val dateKey = formatDate(dt, timezoneOffset) // Use "MMM dd" as key for grouping
+            val dateKey = formatDate(dt, timezoneOffset)
             dailyData.getOrPut(dateKey) { mutableListOf() }.add(item)
         }
 
         val sortedDates = dailyData.keys.sortedWith(compareBy {
-            try {
-                SimpleDateFormat("MMM dd", Locale.getDefault()).parse(it)
-            } catch (e: Exception) {
-                Date(0) // Fallback for sorting if parse fails
-            }
+            try { SimpleDateFormat("MMM dd", Locale.getDefault()).parse(it) } catch (e: Exception) { Date(0) }
         })
-
 
         for (dateKey in sortedDates) {
             val dayEntries = dailyData[dateKey] ?: continue
@@ -512,7 +585,7 @@ fun parseForecastJson(json: JSONObject, unit: String): ForecastUIState {
             var minTemp = Double.MAX_VALUE
             var maxTemp = Double.MIN_VALUE
             val conditionCounts = mutableMapOf<String, Int>()
-            var dominantIconCode = dayEntries.first().optJSONArray("weather")?.optJSONObject(0)?.optString("icon") ?: "01d" // Default icon
+            var dominantIconCode = dayEntries.first().optJSONArray("weather")?.optJSONObject(0)?.optString("icon") ?: "01d"
 
             for (entry in dayEntries) {
                 val main = entry.optJSONObject("main")
@@ -521,31 +594,18 @@ fun parseForecastJson(json: JSONObject, unit: String): ForecastUIState {
                 val weather = entry.optJSONArray("weather")?.optJSONObject(0)
                 val condition = weather?.optString("description") ?: "N/A"
                 conditionCounts[condition] = (conditionCounts[condition] ?: 0) + 1
-
-                // Heuristic for icon: use icon of entry closest to midday or most frequent
-                // For simplicity, let's use the icon from the first entry of the day or one with highest temp.
-                // Or, more simply, the icon from an entry around midday if available.
-                // Here, just using the first entry's icon for simplicity of this example.
-                // A better approach would be to find the most representative icon.
             }
-            // Get representative condition (most frequent)
             val representativeCondition = conditionCounts.maxByOrNull { it.value }?.key ?: dayEntries.first().optJSONArray("weather")?.optJSONObject(0)?.optString("description") ?: "N/A"
-            // For icon, let's try to get one from an entry around midday (e.g. 12:00 or 15:00)
             val middayEntry = dayEntries.find { entry ->
-                val dt = entry.optLong("dt")
-                val hour = formatTime(dt, timezoneOffset, "HH").toIntOrNull()
-                hour in 12..15 // Check if hour is between 12 PM and 3 PM
-            } ?: dayEntries.first() // Fallback to the first entry
-
+                val hour = formatTime(entry.optLong("dt"), timezoneOffset, "HH").toIntOrNull()
+                hour in 12..15
+            } ?: dayEntries.first()
             dominantIconCode = middayEntry.optJSONArray("weather")?.optJSONObject(0)?.optString("icon") ?: dominantIconCode
-
-
-            val firstEntryDt = dayEntries.first().optLong("dt")
 
             dailyForecasts.add(
                 DailyForecastItem(
-                    date = dateKey, // "MMM dd"
-                    dayOfWeek = formatDayOfWeek(firstEntryDt, timezoneOffset), // "EEE"
+                    date = dateKey,
+                    dayOfWeek = formatDayOfWeek(dayEntries.first().optLong("dt"), timezoneOffset),
                     tempMin = "${minTemp.roundToInt()}°$unit",
                     tempMax = "${maxTemp.roundToInt()}°$unit",
                     condition = representativeCondition.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() },
@@ -553,16 +613,12 @@ fun parseForecastJson(json: JSONObject, unit: String): ForecastUIState {
                 )
             )
         }
-
-        return ForecastUIState(dailyForecasts = dailyForecasts.take(5), isLoading = false) // Take up to 5 days
+        return ForecastUIState(dailyForecasts = dailyForecasts.take(5), isLoading = false)
     } catch (e: JSONException) {
         Log.e("ParseForecast", "Error parsing: ${e.message}", e)
         return ForecastUIState(isLoading = false, error = "Error parsing forecast: ${e.localizedMessage}")
     }
 }
-
-
-// Composable "Fragments" / Views
 
 @Composable
 fun CurrentWeatherBasicInfoView(data: CurrentWeatherUIState) {
@@ -570,27 +626,22 @@ fun CurrentWeatherBasicInfoView(data: CurrentWeatherUIState) {
         if (data.isLoading) {
             CircularProgressIndicator(modifier = Modifier.align(Alignment.CenterHorizontally))
         } else if (data.error != null) {
-            Text("Error: ${data.error}", color = MaterialTheme.colorScheme.error)
+            Text("Error: ${data.error}", color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
         } else {
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                Icon(
-                    imageVector = data.weatherIcon,
-                    contentDescription = data.weatherCondition,
-                    modifier = Modifier.size(80.dp).padding(end = 16.dp),
-                    tint = MaterialTheme.colorScheme.primary
-                )
+                Icon(imageVector = data.weatherIcon, contentDescription = data.weatherCondition, modifier = Modifier.size(80.dp).padding(end = 16.dp), tint = MaterialTheme.colorScheme.primary)
                 Column(modifier = Modifier.weight(1f)) {
                     Text(data.temperature, style = MaterialTheme.typography.displaySmall, fontWeight = FontWeight.Bold)
                     Text(data.weatherCondition, style = MaterialTheme.typography.titleMedium)
                     Text(data.feelsLike, style = MaterialTheme.typography.bodyMedium)
                 }
             }
-            Spacer(modifier = Modifier.height(16.dp))
-            InfoRow(label = "Time:", value = data.observationTime)
-            InfoRow(label = "Coordinates:", value = data.coordinates)
-            InfoRow(label = "Pressure:", value = data.pressure)
-            InfoRow(label = "Sunrise:", value = data.sunrise)
-            InfoRow(label = "Sunset:", value = data.sunset)
+            Spacer(Modifier.height(16.dp))
+            InfoRow("Time:", data.observationTime)
+            InfoRow("Coordinates:", data.coordinates)
+            InfoRow("Pressure:", data.pressure)
+            InfoRow("Sunrise:", data.sunrise)
+            InfoRow("Sunset:", data.sunset)
         }
     }
 }
@@ -601,11 +652,11 @@ fun CurrentWeatherDetailedInfoView(data: CurrentWeatherUIState) {
         if (data.isLoading) {
             CircularProgressIndicator(modifier = Modifier.align(Alignment.CenterHorizontally))
         } else if (data.error != null) {
-            Text("Error: ${data.error}", color = MaterialTheme.colorScheme.error)
+            Text("Error: ${data.error}", color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
         } else {
-            InfoRow(label = "Wind:", value = "${data.windSpeed}, ${data.windDirection}")
-            InfoRow(label = "Humidity:", value = data.humidity)
-            InfoRow(label = "Visibility:", value = data.visibility)
+            InfoRow("Wind:", "${data.windSpeed}, ${data.windDirection}")
+            InfoRow("Humidity:", data.humidity)
+            InfoRow("Visibility:", data.visibility)
         }
     }
 }
@@ -616,15 +667,14 @@ fun ForecastView(data: ForecastUIState) {
         if (data.isLoading) {
             CircularProgressIndicator(modifier = Modifier.align(Alignment.CenterHorizontally))
         } else if (data.error != null) {
-            Text("Error: ${data.error}", color = MaterialTheme.colorScheme.error)
+            Text("Error: ${data.error}", color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
         } else if (data.dailyForecasts.isEmpty()){
-            Text("No forecast data available.")
-        }
-        else {
+            Text("No forecast data available.", textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+        } else {
             Column {
-                data.dailyForecasts.forEach { forecastItem ->
-                    ForecastItemRow(item = forecastItem)
-                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                data.dailyForecasts.forEach { item ->
+                    ForecastItemRow(item)
+                    HorizontalDivider(Modifier.padding(vertical = 4.dp))
                 }
             }
         }
@@ -633,57 +683,23 @@ fun ForecastView(data: ForecastUIState) {
 
 @Composable
 fun ForecastItemRow(item: DailyForecastItem) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(modifier = Modifier.weight(0.8f)) {
+    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(0.8f)) {
             Text(item.dayOfWeek, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
             Text(item.date, style = MaterialTheme.typography.bodySmall)
         }
-        Icon(
-            imageVector = item.icon,
-            contentDescription = item.condition,
-            modifier = Modifier.size(40.dp).padding(horizontal = 8.dp),
-            tint = MaterialTheme.colorScheme.primary
-        )
-        Column(modifier = Modifier.weight(1.5f), horizontalAlignment = Alignment.Start) {
-            Text(item.condition, style = MaterialTheme.typography.bodyMedium)
-        }
-        Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.End) {
-            Text("${item.tempMax} / ${item.tempMin}", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
-        }
+        Icon(item.icon, item.condition, Modifier.size(40.dp).padding(horizontal = 8.dp), tint = MaterialTheme.colorScheme.primary)
+        Column(Modifier.weight(1.5f), horizontalAlignment = Alignment.Start) { Text(item.condition, style = MaterialTheme.typography.bodyMedium) }
+        Column(Modifier.weight(1f), horizontalAlignment = Alignment.End) { Text("${item.tempMax} / ${item.tempMin}", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium) }
     }
 }
 
-
 @Composable
-fun DataCard(
-    title: String,
-    modifier: Modifier = Modifier,
-    content: @Composable ColumnScope.() -> Unit
-) {
-    Card(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(vertical = 8.dp),
-        shape = RoundedCornerShape(12.dp),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp)
-        ) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.padding(bottom = 12.dp)
-            )
-            HorizontalDivider(modifier = Modifier.padding(bottom = 12.dp))
+fun DataCard(title: String, modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
+    Card(modifier.fillMaxWidth().padding(vertical = 8.dp), RoundedCornerShape(12.dp), elevation = CardDefaults.cardElevation(2.dp)) {
+        Column(Modifier.fillMaxWidth().padding(16.dp)) {
+            Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 12.dp))
+            HorizontalDivider(Modifier.padding(bottom = 12.dp))
             content()
         }
     }
@@ -691,25 +707,10 @@ fun DataCard(
 
 @Composable
 fun InfoRow(label: String, value: String, icon: ImageVector? = null) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        if (icon != null) {
-            Icon(imageVector = icon, contentDescription = label, modifier = Modifier.size(20.dp).padding(end = 8.dp), tint = MaterialTheme.colorScheme.secondary)
-        }
-        Text(
-            text = "$label ",
-            style = MaterialTheme.typography.bodyMedium,
-            fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Text(
-            text = value,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurface
-        )
+    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        icon?.let { Icon(it, label, Modifier.size(20.dp).padding(end = 8.dp), tint = MaterialTheme.colorScheme.secondary) }
+        Text("$label ", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(value, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
     }
 }
+
