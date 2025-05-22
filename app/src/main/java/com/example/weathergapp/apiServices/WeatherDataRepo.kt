@@ -7,10 +7,8 @@ import org.json.JSONObject
 object WeatherDataRepo {
     private var _weatherDataJson: JSONObject? = null
     private var _forecastDataJson: JSONObject? = null
-    private var _hourlyDataJson: JSONObject? = null
     private val weatherObservers = mutableListOf<WeatherDataObserver>()
     private val forecastObservers = mutableListOf<WeatherDataObserver>()
-    private val hourlyObservers = mutableListOf<WeatherDataObserver>()
 
 
     @Synchronized
@@ -41,21 +39,6 @@ object WeatherDataRepo {
     @Synchronized
     fun getForecastDataJson(): JSONObject? {
         return _forecastDataJson
-    }
-
-    @Synchronized
-    fun setHourlyDataJson(value: JSONObject?) {
-        if (value != null) {
-            _hourlyDataJson = value
-            notifyHourlyObservers()
-        } else {
-            Log.e("WeatherDataRepository", "Attempted to set null hourly data JSON")
-        }
-    }
-
-    @Synchronized
-    fun getHourlyDataJson(): JSONObject? {
-        return _hourlyDataJson
     }
 
 
@@ -89,28 +72,12 @@ object WeatherDataRepo {
         forecastObservers.remove(observer)
     }
 
-    @Synchronized
-    fun registerHourlyObserver(observer: WeatherDataObserver) {
-        if (!hourlyObservers.contains(observer)) {
-            hourlyObservers.add(observer)
-        }
-    }
-
-    @Synchronized
-    fun unregisterHourlyObserver(observer: WeatherDataObserver) {
-        hourlyObservers.remove(observer)
-    }
-
     private fun notifyWeatherObservers() {
         weatherObservers.forEach { it.onWeatherDataUpdated() }
     }
 
     private fun notifyForecastObservers() {
         forecastObservers.forEach { it.onForecastDataUpdated() }
-    }
-
-    private fun notifyHourlyObservers() {
-        hourlyObservers.forEach { it.onHourlyDataUpdated() }
     }
 
 }

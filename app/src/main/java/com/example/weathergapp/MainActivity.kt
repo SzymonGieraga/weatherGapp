@@ -5,7 +5,6 @@ import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -24,25 +23,29 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.example.weathergapp.apiServices.WeatherDataRepo
 import com.example.weathergapp.apiServices.apiServices
-import java.io.IOException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import org.json.JSONException
 import org.json.JSONObject
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.math.roundToInt
 
+// Data classes
 data class CurrentWeatherUIState(
     val locationName: String = "N/A",
     val coordinates: String = "Lat: N/A, Lon: N/A",
@@ -59,7 +62,8 @@ data class CurrentWeatherUIState(
     val sunrise: String = "N/A",
     val sunset: String = "N/A",
     val isLoading: Boolean = true,
-    val error: String? = null
+    val error: String? = null,
+    val isOfflineData: Boolean = false
 )
 
 data class DailyForecastItem(
@@ -74,16 +78,17 @@ data class DailyForecastItem(
 data class ForecastUIState(
     val dailyForecasts: List<DailyForecastItem> = emptyList(),
     val isLoading: Boolean = true,
-    val error: String? = null
+    val error: String? = null,
+    val isOfflineData: Boolean = false
 )
 
 class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
 
     private lateinit var apiService: apiServices
-    private var userInputLocation by mutableStateOf("London")
+    private var userInputLocation by mutableStateOf("Warsaw, PL") // Default location
     private var currentWeatherDataState by mutableStateOf(CurrentWeatherUIState())
     private var forecastDataState by mutableStateOf(ForecastUIState())
-    private var общийLoadingState by mutableStateOf(false)
+    private var forecastLoadingState by mutableStateOf(false) // generalLoadingState
     private var errorMessage by mutableStateOf<String?>(null)
     private var selectedUnit by mutableStateOf("°C")
 
@@ -93,19 +98,19 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
     private var favoriteLocations by mutableStateOf(listOf<String>())
     private var showFavoritesDialog by mutableStateOf(false)
 
+    private var showOfflineWarningBanner by mutableStateOf(false)
+
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         apiService = apiServices(this)
         favoriteLocations = apiService.loadFavorites().toMutableList()
-        WeatherDataRepo.registerWeatherObserver(this)
-        WeatherDataRepo.registerForecastObserver(this)
-
         autoRefreshIntervalMinutes = SettingsManager.loadRefreshInterval(this)
 
-        if (DataManager.unit.isNotBlank()) {
-            selectedUnit = DataManager.unit
+        val savedUnit = DataManager.unit
+        if (savedUnit.isNotBlank()) {
+            selectedUnit = savedUnit
         } else {
             DataManager.unit = selectedUnit
         }
@@ -115,32 +120,158 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
                 val oldUnit = selectedUnit
                 selectedUnit = newUnit
                 if (oldUnit != newUnit && userInputLocation.isNotEmpty() && !currentWeatherDataState.isLoading) {
-                    fetchWeatherData(userInputLocation, isManualRefresh = true)
+                    if (apiService.isNetworkAvailable()) {
+                        fetchWeatherData(userInputLocation, isManualRefresh = true)
+                    } else {
+                        loadOfflineWeatherData(userInputLocation, newUnit, showToastIfNotFound = false)
+                        Toast.makeText(this@MainActivity, "Unit changed. Offline data might need online refresh for full accuracy.", Toast.LENGTH_LONG).show()
+                    }
                 }
             }
         })
 
-        if (currentWeatherDataState.isLoading) {
+        val lastViewedLocation = apiService.loadLastViewedLocation()
+        userInputLocation = lastViewedLocation ?: favoriteLocations.firstOrNull() ?: "Warsaw. PL" // Default to Warsaw
+
+        if (apiService.isNetworkAvailable()) {
+            showOfflineWarningBanner = false
+            Log.d("MainActivity", "Network available. Fetching data for: $userInputLocation")
             fetchWeatherData(userInputLocation, isManualRefresh = false)
+            lifecycleScope.launch {
+                cacheFavoriteLocationsData()
+            }
+        } else {
+            showOfflineWarningBanner = true
+            Log.d("MainActivity", "Network unavailable. Attempting to load offline data for: $userInputLocation")
+            Toast.makeText(this, "No internet connection. Displaying saved data.", Toast.LENGTH_LONG).show()
+            loadOfflineWeatherData(userInputLocation, selectedUnit, showToastIfNotFound = true)
         }
+
+        WeatherDataRepo.registerWeatherObserver(this)
+        WeatherDataRepo.registerForecastObserver(this)
 
         setContent {
             WeatherAppScreen()
 
-            val lifecycleOwner = LocalLifecycleOwner.current
-            LaunchedEffect(autoRefreshIntervalMinutes, userInputLocation, lifecycleOwner) {
-                if (autoRefreshIntervalMinutes > 0) {
+            val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+            LaunchedEffect(autoRefreshIntervalMinutes, userInputLocation, lifecycleOwner, apiService.isNetworkAvailable()) {
+                if (autoRefreshIntervalMinutes > 0 && apiService.isNetworkAvailable()) {
                     lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
                         while (isActive) {
                             Log.d("AutoRefresh", "Delaying for $autoRefreshIntervalMinutes minutes.")
                             delay(autoRefreshIntervalMinutes * 60 * 1000L)
-                            if (isActive) {
+                            if (isActive && apiService.isNetworkAvailable()) {
                                 Log.d("AutoRefresh", "Interval elapsed, fetching weather data for $userInputLocation")
                                 fetchWeatherData(userInputLocation, isManualRefresh = false)
+                            } else if (!apiService.isNetworkAvailable()) {
+                                Log.d("AutoRefresh", "Network lost, auto-refresh paused.")
+                                showOfflineWarningBanner = true
                             }
                         }
                     }
+                } else if (autoRefreshIntervalMinutes > 0 && !apiService.isNetworkAvailable()) {
+                    Log.d("AutoRefresh", "No network, auto-refresh inactive at start.")
+                    showOfflineWarningBanner = true
                 }
+            }
+        }
+    }
+    private suspend fun cacheFavoriteLocationsData() {
+        if (!apiService.isNetworkAvailable()) return
+
+        Log.d("MainActivity", "Starting to cache data for favorites.")
+        favoriteLocations.forEach { favLocation ->
+            apiService.getData(favLocation, selectedUnit, object : apiServices.ResponseCallback {
+                override fun onSuccess(result: String) {
+                    try {
+                        val json = JSONObject(result)
+                        val locationNameFromApi = json.optString("name", favLocation)
+                        apiService.saveCurrentWeatherData(locationNameFromApi, result)
+                        Log.d("CacheFavorites", "Cached current weather for favorite: $locationNameFromApi")
+
+                        val coord = json.optJSONObject("coord")
+                        if (coord != null) {
+                            apiService.getForecastData(coord.getDouble("lat"), coord.getDouble("lon"), selectedUnit, object : apiServices.ResponseCallback {
+                                override fun onSuccess(result: String) {
+                                    apiService.saveForecastData(locationNameFromApi, result)
+                                    Log.d("CacheFavorites", "Cached forecast for favorite: $locationNameFromApi")
+                                }
+                                override fun onFailure(e: IOException?) {
+                                    Log.e("CacheFavorites", "Failed to fetch forecast for favorite $locationNameFromApi", e)
+                                }
+                            })
+                        }
+                    } catch (e: JSONException) {
+                        Log.e("CacheFavorites", "JSON parsing error for favorite $favLocation (current weather)", e)
+                    }
+                }
+                override fun onFailure(e: IOException?) {
+                    Log.e("CacheFavorites", "Failed to fetch current weather for favorite $favLocation", e)
+                }
+            })
+            delay(1000) // Small delay between API requests to avoid rate limiting
+        }
+        Log.d("MainActivity", "Finished caching data for favorites.")
+    }
+
+    private fun loadOfflineWeatherData(location: String, unit: String, showToastIfNotFound: Boolean) {
+        Log.d("MainActivity", "Attempting to load offline data for: $location, unit: $unit")
+        forecastLoadingState = true
+        currentWeatherDataState = CurrentWeatherUIState(isLoading = true, locationName = location, isOfflineData = true)
+        forecastDataState = ForecastUIState(isLoading = true, isOfflineData = true)
+
+        val currentJsonString = apiService.loadCurrentWeatherData(location)
+        val forecastJsonString = apiService.loadForecastData(location)
+        var currentDataLoaded = false
+        var forecastDataLoaded = false
+
+        if (currentJsonString != null) {
+            try {
+                val currentJson = JSONObject(currentJsonString)
+                currentWeatherDataState = parseCurrentWeatherJson(currentJson, unit).copy(isOfflineData = true)
+                currentDataLoaded = true
+                Log.d("MainActivity", "Successfully loaded current offline data for $location")
+            } catch (e: JSONException) {
+                Log.e("MainActivity", "Error parsing current offline data for $location", e)
+                currentWeatherDataState = CurrentWeatherUIState(isLoading = false, error = "Error loading offline data.", locationName = location, isOfflineData = true)
+            }
+        } else {
+            Log.d("MainActivity", "No saved current offline data for $location")
+            currentWeatherDataState = CurrentWeatherUIState(isLoading = false, error = "No saved data for $location.", locationName = location, isOfflineData = true)
+        }
+
+        if (forecastJsonString != null) {
+            try {
+                val forecastJson = JSONObject(forecastJsonString)
+                forecastDataState = parseForecastJson(forecastJson, unit).copy(isOfflineData = true)
+                forecastDataLoaded = true
+                Log.d("MainActivity", "Successfully loaded forecast offline data for $location")
+            } catch (e: JSONException) {
+                Log.e("MainActivity", "Error parsing forecast offline data for $location", e)
+                forecastDataState = ForecastUIState(isLoading = false, error = "Error loading offline forecast.", isOfflineData = true)
+            }
+        } else {
+            Log.d("MainActivity", "No saved forecast offline data for $location")
+            forecastDataState = if (currentDataLoaded) {
+                ForecastUIState(isLoading = false, error = "No saved forecast for $location.", isOfflineData = true)
+            } else {
+                ForecastUIState(isLoading = false, error = "No saved data for $location.", isOfflineData = true)
+            }
+        }
+        forecastLoadingState = false
+        showOfflineWarningBanner = true
+
+        if (!currentDataLoaded && !forecastDataLoaded && showToastIfNotFound) {
+            Toast.makeText(this, "No saved offline data for $location.", Toast.LENGTH_LONG).show()
+            if (location != favoriteLocations.firstOrNull() && favoriteLocations.isNotEmpty()) {
+                val firstFavorite = favoriteLocations.first()
+                userInputLocation = firstFavorite
+                Log.d("MainActivity", "No data for $location, trying to load for first favorite: $firstFavorite")
+                loadOfflineWeatherData(firstFavorite, unit, showToastIfNotFound = false)
+            } else if (favoriteLocations.isEmpty() && location != "London") {
+                userInputLocation = "London"
+                Log.d("MainActivity", "No data and no favorites, trying to load for London")
+                loadOfflineWeatherData("London", unit, showToastIfNotFound = false)
             }
         }
     }
@@ -154,10 +285,10 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
     override fun onWeatherDataUpdated() {
         val newJson = WeatherDataRepo.getWeatherDataJson()
         runOnUiThread {
-            if (newJson != null) {
-                currentWeatherDataState = parseCurrentWeatherJson(newJson, selectedUnit)
+            currentWeatherDataState = if (newJson != null) {
+                parseCurrentWeatherJson(newJson, selectedUnit).copy(isOfflineData = !apiService.isNetworkAvailable())
             } else {
-                currentWeatherDataState = currentWeatherDataState.copy(
+                currentWeatherDataState.copy(
                     isLoading = false,
                     error = "Failed to load current weather."
                 )
@@ -168,10 +299,10 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
     override fun onForecastDataUpdated() {
         val newJson = WeatherDataRepo.getForecastDataJson()
         runOnUiThread {
-            if (newJson != null) {
-                forecastDataState = parseForecastJson(newJson, selectedUnit)
+            forecastDataState = if (newJson != null) {
+                parseForecastJson(newJson, selectedUnit).copy(isOfflineData = !apiService.isNetworkAvailable())
             } else {
-                forecastDataState = forecastDataState.copy(
+                forecastDataState.copy(
                     isLoading = false,
                     error = "Failed to load forecast."
                 )
@@ -179,7 +310,7 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
         }
     }
 
-    override fun onHourlyDataUpdated() { /* NIE WIEM CO Z TYM SERIO*/ }
+    override fun onHourlyDataUpdated() { /* 10H roboty robi BRRRRRRRRR*/ }
 
     private fun fetchWeatherData(location: String, isManualRefresh: Boolean) {
         if (location.isBlank()) {
@@ -189,8 +320,16 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
             }
             return
         }
-        Log.d("MainActivity", "Fetching weather for: $location, Unit: $selectedUnit, Manual: $isManualRefresh")
-        общийLoadingState = true
+
+        if (!apiService.isNetworkAvailable()) {
+            showOfflineWarningBanner = true
+            Toast.makeText(this, "No internet connection. Attempting to load offline data.", Toast.LENGTH_LONG).show()
+            loadOfflineWeatherData(location, selectedUnit, showToastIfNotFound = true)
+            return
+        }
+        showOfflineWarningBanner = false
+        Log.d("MainActivity", "Fetching data for: $location, Unit: $selectedUnit, Manual: $isManualRefresh")
+        forecastLoadingState = true
         errorMessage = null
         currentWeatherDataState = CurrentWeatherUIState(isLoading = true, locationName = location)
         forecastDataState = ForecastUIState(isLoading = true)
@@ -199,10 +338,20 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
             override fun onSuccess(result: String) {
                 try {
                     val json = JSONObject(result)
+                    val locationNameFromApi = json.optString("name", location)
+                    val country = json.optJSONObject("sys")?.optString("country", "")
+                    val actualLocationName = if (country.isNullOrBlank() || locationNameFromApi.contains(country)) locationNameFromApi else "$locationNameFromApi, $country"
+
+                    apiService.saveCurrentWeatherData(actualLocationName, result)
+                    apiService.saveLastViewedLocation(actualLocationName)
+                    if (userInputLocation != actualLocationName) {
+                        userInputLocation = actualLocationName
+                    }
+
                     WeatherDataRepo.setWeatherDataJson(json)
                     val coord = json.optJSONObject("coord")
                     if (coord != null) {
-                        fetchForecastData(coord.getDouble("lat"), coord.getDouble("lon"), isManualRefresh)
+                        fetchForecastData(actualLocationName, coord.getDouble("lat"), coord.getDouble("lon"), isManualRefresh)
                     } else {
                         handleFetchError("Coordinates not found.", isManualRefresh)
                     }
@@ -215,14 +364,16 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
             override fun onFailure(e: IOException?) {
                 Log.e("MainActivity", "Failed to fetch current weather", e)
                 handleFetchError("API Error: ${e?.message ?: "Unknown error"}", isManualRefresh)
+                loadOfflineWeatherData(location, selectedUnit, showToastIfNotFound = false)
             }
         })
     }
 
-    private fun fetchForecastData(lat: Double, lon: Double, isManualRefresh: Boolean) {
+    private fun fetchForecastData(locationNameForFile: String, lat: Double, lon: Double, isManualRefresh: Boolean) {
         apiService.getForecastData(lat, lon, selectedUnit, object : apiServices.ResponseCallback {
             override fun onSuccess(result: String) {
                 try {
+                    apiService.saveForecastData(locationNameForFile, result)
                     WeatherDataRepo.setForecastDataJson(JSONObject(result))
                     if (isManualRefresh) {
                         runOnUiThread {
@@ -233,13 +384,14 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
                     Log.e("MainActivity", "Error parsing forecast JSON", e)
                     handleFetchError("Error parsing forecast: ${e.message}", isManualRefresh, isForecast = true)
                 } finally {
-                    runOnUiThread { общийLoadingState = false }
+                    runOnUiThread { forecastLoadingState = false }
                 }
             }
 
             override fun onFailure(e: IOException?) {
                 Log.e("MainActivity", "Failed to fetch forecast", e)
                 handleFetchError("API Error (Forecast): ${e?.message ?: "Unknown error"}", isManualRefresh, isForecast = true)
+                runOnUiThread { forecastLoadingState = false }
             }
         })
     }
@@ -247,16 +399,18 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
     private fun handleFetchError(errorMsg: String, isManualRefresh: Boolean, isForecast: Boolean = false) {
         runOnUiThread {
             errorMessage = errorMsg
-            общийLoadingState = false
+            forecastLoadingState = false
+            val isOffline = !apiService.isNetworkAvailable()
             if (isForecast) {
-                forecastDataState = forecastDataState.copy(isLoading = false, error = errorMsg)
+                forecastDataState = forecastDataState.copy(isLoading = false, error = errorMsg, isOfflineData = isOffline)
             } else {
                 currentWeatherDataState = currentWeatherDataState.copy(
                     isLoading = false,
                     error = errorMsg,
-                    locationName = if (userInputLocation.isNotBlank()) userInputLocation else "N/A"
+                    locationName = userInputLocation.ifBlank { "N/A" },
+                    isOfflineData = isOffline
                 )
-                forecastDataState = forecastDataState.copy(isLoading = false, error = "Dependency error: $errorMsg")
+                forecastDataState = forecastDataState.copy(isLoading = false, error = "Dependency error: $errorMsg", isOfflineData = isOffline)
             }
             if (isManualRefresh || !isForecast) {
                 Toast.makeText(this@MainActivity, errorMsg, Toast.LENGTH_LONG).show()
@@ -273,11 +427,12 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
 
         val currentFavoritesMutable = favoriteLocations.toMutableList()
         val isCurrentlyFavorite = currentFavoritesMutable.any { it.equals(location, ignoreCase = true) }
-
         var changed = false
+
         if (isCurrentlyFavorite) {
             if (currentFavoritesMutable.removeAll { it.equals(location, ignoreCase = true) }) {
                 Toast.makeText(this, "$location removed from favorites", Toast.LENGTH_SHORT).show()
+                apiService.deleteWeatherDataForLocation(location)
                 changed = true
             }
         } else {
@@ -285,11 +440,17 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
                 currentFavoritesMutable.add(location)
                 Toast.makeText(this, "$location added to favorites", Toast.LENGTH_SHORT).show()
                 changed = true
-            } else if (!currentFavoritesMutable.contains(location)) {
+                if (apiService.isNetworkAvailable()) {
+                    lifecycleScope.launch { cacheSingleFavoriteData(location) }
+                }
+            } else if (!currentFavoritesMutable.contains(location)) { // Case where casing is different
                 currentFavoritesMutable.removeAll{ it.equals(location, ignoreCase = true)}
-                currentFavoritesMutable.add(location)
+                currentFavoritesMutable.add(location) // Add with current casing
                 Toast.makeText(this, "$location (casing updated) is a favorite", Toast.LENGTH_SHORT).show()
                 changed = true
+                if (apiService.isNetworkAvailable()) { // Re-cache if casing changed and online
+                    lifecycleScope.launch { cacheSingleFavoriteData(location) }
+                }
             }
         }
 
@@ -298,62 +459,113 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
             favoriteLocations = currentFavoritesMutable
         }
     }
+    private suspend fun cacheSingleFavoriteData(location: String) {
+        if (!apiService.isNetworkAvailable()) return
+        Log.d("MainActivity", "Caching data for single favorite: $location")
+        apiService.getData(location, selectedUnit, object : apiServices.ResponseCallback {
+            override fun onSuccess(result: String) {
+                try {
+                    val json = JSONObject(result)
+                    val locationNameFromApi = json.optString("name", location)
+                    val country = json.optJSONObject("sys")?.optString("country", "")
+                    val actualLocationName = if (country.isNullOrBlank() || locationNameFromApi.contains(country)) locationNameFromApi else "$locationNameFromApi, $country"
 
-    // Corrected function
+                    apiService.saveCurrentWeatherData(actualLocationName, result)
+                    val coord = json.optJSONObject("coord")
+                    if (coord != null) {
+                        apiService.getForecastData(coord.getDouble("lat"), coord.getDouble("lon"), selectedUnit, object : apiServices.ResponseCallback {
+                            override fun onSuccess(forecastResult: String) {
+                                apiService.saveForecastData(actualLocationName, forecastResult)
+                                Log.d("CacheSingleFavorite", "Cached data for $actualLocationName")
+                            }
+                            override fun onFailure(e: IOException?) { Log.e("CacheSingleFavorite", "Failed to cache forecast for $actualLocationName",e) }
+                        })
+                    }
+                } catch (e: JSONException) { Log.e("CacheSingleFavorite", "JSON error caching $location",e) }
+            }
+            override fun onFailure(e: IOException?) { Log.e("CacheSingleFavorite", "API error caching $location",e) }
+        })
+    }
+
     private fun deleteFavorite(location: String) {
         val currentFavoritesMutable = favoriteLocations.toMutableList()
         val removed = currentFavoritesMutable.removeAll { it.equals(location, ignoreCase = true) }
 
         if (removed) {
             apiService.saveFavorites(currentFavoritesMutable.toList())
+            apiService.deleteWeatherDataForLocation(location)
             Toast.makeText(this, "$location removed from favorites", Toast.LENGTH_SHORT).show()
             favoriteLocations = currentFavoritesMutable
         }
     }
 
-
-    @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+    @OptIn(ExperimentalMaterial3Api::class)
     @Composable
     fun WeatherAppScreen() {
         var tempUserInputLocation by remember { mutableStateOf(userInputLocation) }
         val isCurrentLocationFavorite = isLocationFavorite(userInputLocation)
-
+        val context = LocalContext.current
 
         LaunchedEffect(userInputLocation) {
             tempUserInputLocation = userInputLocation
         }
+        LaunchedEffect(Unit) { // Initial check and listener for network status
+            showOfflineWarningBanner = !apiService.isNetworkAvailable()
+        }
 
         Scaffold(
             topBar = {
-                TopAppBar(
-                    title = { Text("WeatherGapp") },
-                    colors = TopAppBarDefaults.topAppBarColors(
-                        containerColor = MaterialTheme.colorScheme.primaryContainer,
-                        titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
-                    ),
-                    actions = {
-                        if (userInputLocation.isNotBlank() && !currentWeatherDataState.isLoading && currentWeatherDataState.error == null) {
-                            IconButton(onClick = { toggleFavorite(userInputLocation) }) {
-                                Icon(
-                                    if (isCurrentLocationFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
-                                    contentDescription = if (isCurrentLocationFavorite) "Remove from Favorites" else "Add to Favorites"
-                                )
+                Column {
+                    TopAppBar(
+                        title = { Text("WeatherGapp") },
+                        colors = TopAppBarDefaults.topAppBarColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer,
+                            titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                        ),
+                        actions = {
+                            if (userInputLocation.isNotBlank() && !currentWeatherDataState.isLoading && currentWeatherDataState.error == null) {
+                                IconButton(onClick = { toggleFavorite(userInputLocation) }) {
+                                    Icon(
+                                        imageVector = if (isCurrentLocationFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+                                        contentDescription = if (isCurrentLocationFavorite) "Remove from Favorites" else "Add to Favorites",
+                                        tint = Color.Black
+                                    )
+                                }
+                            }
+                            IconButton(onClick = { showFavoritesDialog = true }) {
+                                Icon(Icons.Filled.Bookmarks, contentDescription = "Favorites", tint = Color.Black)
+                            }
+                            IconButton(onClick = {
+                                Log.d("MainActivity", "Manual refresh.")
+                                if (apiService.isNetworkAvailable()) {
+                                    fetchWeatherData(userInputLocation, isManualRefresh = true)
+                                } else {
+                                    showOfflineWarningBanner = true
+                                    Toast.makeText(context, "No internet connection. Cannot refresh.", Toast.LENGTH_LONG).show()
+                                    loadOfflineWeatherData(userInputLocation, selectedUnit, showToastIfNotFound = true)
+                                }
+                            }) {
+                                Icon(Icons.Filled.Refresh, contentDescription = "Refresh", tint = Color.Black)
+                            }
+                            IconButton(onClick = { showSettingsDialog = true }) {
+                                Icon(Icons.Filled.Settings, contentDescription = "Settings", tint = Color.Black)
                             }
                         }
-                        IconButton(onClick = { showFavoritesDialog = true }) {
-                            Icon(Icons.Filled.Bookmarks, contentDescription = "Favorites")
-                        }
-                        IconButton(onClick = {
-                            Log.d("MainActivity", "Manual refresh triggered.")
-                            fetchWeatherData(userInputLocation, isManualRefresh = true)
-                        }) {
-                            Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
-                        }
-                        IconButton(onClick = { showSettingsDialog = true }) {
-                            Icon(Icons.Filled.Settings, contentDescription = "Settings")
+                    )
+                    if (showOfflineWarningBanner) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.errorContainer,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = "No internet connection. Data may be outdated.",
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(8.dp),
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
                         }
                     }
-                )
+                }
             }
         ) { paddingValues ->
             Column(
@@ -361,81 +573,102 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
                     .padding(paddingValues)
                     .fillMaxSize()
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    OutlinedTextField(
-                        value = tempUserInputLocation,
-                        onValueChange = { tempUserInputLocation = it },
-                        label = { Text("Enter Location") },
-                        modifier = Modifier.weight(1f).padding(end = 8.dp),
-                        singleLine = true
-                    )
-                    Button(
-                        onClick = {
-                            userInputLocation = tempUserInputLocation
-                            fetchWeatherData(userInputLocation, isManualRefresh = true)
-                        },
-                        enabled = !общийLoadingState && tempUserInputLocation.isNotBlank()
+                Column {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Icon(Icons.Filled.Search, contentDescription = "Search")
-                    }
-                }
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).fillMaxWidth(),
-                    horizontalArrangement = Arrangement.Center
-                ) {
-                    Text("Unit:", modifier = Modifier.padding(end = 8.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        RadioButton(selected = selectedUnit == "°C", onClick = { DataManager.unit = "°C" })
-                        Text("Celsius", modifier = Modifier.padding(end = 16.dp, start = 4.dp))
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        RadioButton(selected = selectedUnit == "°F", onClick = { DataManager.unit = "°F" })
-                        Text("Fahrenheit", modifier = Modifier.padding(start = 4.dp))
-                    }
-                }
-
-                if (общийLoadingState && currentWeatherDataState.isLoading && forecastDataState.isLoading && errorMessage == null) {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator()
-                    }
-                } else if (errorMessage != null) {
-                    Box(modifier = Modifier.fillMaxSize().padding(16.dp), contentAlignment = Alignment.Center) {
-                        Text(
-                            "Error: $errorMessage\n${if (currentWeatherDataState.locationName != "N/A" && currentWeatherDataState.locationName != userInputLocation && !currentWeatherDataState.isLoading) "Showing last known data for ${currentWeatherDataState.locationName}" else ""}",
-                            color = MaterialTheme.colorScheme.error,
-                            textAlign = TextAlign.Center
+                        OutlinedTextField(
+                            value = tempUserInputLocation,
+                            onValueChange = { tempUserInputLocation = it },
+                            label = { Text("Enter Location") },
+                            modifier = Modifier.weight(1f).padding(end = 8.dp),
+                            singleLine = true
                         )
+                        Button(
+                            onClick = {
+                                userInputLocation = tempUserInputLocation
+                                fetchWeatherData(userInputLocation, isManualRefresh = true)
+                            },
+                            enabled = !forecastLoadingState && tempUserInputLocation.isNotBlank(),
+                            colors = ButtonDefaults.buttonColors(
+                                contentColor = Color.White, // Assuming a dark button background
+                                containerColor = Color.Black // Making button background black
+                            )
+                        ) {
+                            Icon(Icons.Filled.Search, contentDescription = "Search", tint = Color.White) // Icon tint white for black background
+                        }
                     }
-                } else {
-                    BoxWithConstraints {
-                        if (this.maxWidth < 600.dp) {
-                            val pagerState = rememberPagerState(pageCount = { 3 })
-                            Column {
-                                HorizontalPager(state = pagerState, modifier = Modifier.weight(1f)) { page ->
-                                    WeatherPage(page, currentWeatherDataState, forecastDataState)
-                                }
-                                Row(
-                                    Modifier.height(50.dp).fillMaxWidth().padding(bottom = 8.dp),
-                                    horizontalArrangement = Arrangement.Center
-                                ) {
-                                    repeat(pagerState.pageCount) { iteration ->
-                                        val color = if (pagerState.currentPage == iteration) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.3f)
-                                        Box(modifier = Modifier.padding(4.dp).clip(CircleShape).size(12.dp).background(color))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Text("Unit:", modifier = Modifier.padding(end = 8.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            RadioButton(
+                                selected = selectedUnit == "°C",
+                                onClick = { DataManager.unit = "°C" },
+                                colors = RadioButtonDefaults.colors(
+                                    selectedColor = Color.Black,
+                                    unselectedColor = Color.DarkGray
+                                )
+                            )
+                            Text("Celsius", modifier = Modifier.padding(end = 16.dp, start = 4.dp))
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            RadioButton(
+                                selected = selectedUnit == "°F",
+                                onClick = { DataManager.unit = "°F" },
+                                colors = RadioButtonDefaults.colors(
+                                    selectedColor = Color.Black,
+                                    unselectedColor = Color.DarkGray
+                                )
+                            )
+                            Text("Fahrenheit", modifier = Modifier.padding(start = 4.dp))
+                        }
+                    }
+                }
+                Box(modifier = Modifier.weight(1f)) {
+                    if (forecastLoadingState && currentWeatherDataState.isLoading && forecastDataState.isLoading && errorMessage == null) {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator()
+                        }
+                    } else if (errorMessage != null && (!currentWeatherDataState.isOfflineData || currentWeatherDataState.locationName == "N/A")) {
+                        Box(modifier = Modifier.fillMaxSize().padding(16.dp), contentAlignment = Alignment.Center) {
+                            Text(
+                                "Error: $errorMessage",
+                                color = MaterialTheme.colorScheme.error,
+                                textAlign = TextAlign.Center
+                            )
+                        }
+                    } else {
+                        BoxWithConstraints(modifier = Modifier.fillMaxSize()) { // Ensure BoxWithConstraints fills the weighted Box
+                            if (this.maxWidth < 600.dp) {
+                                val pagerState = rememberPagerState(pageCount = { 3 })
+                                Column(modifier = Modifier.fillMaxSize()) { // Ensure Column fills BoxWithConstraints
+                                    HorizontalPager(state = pagerState, modifier = Modifier.weight(1f)) { page ->
+                                        WeatherPage(page, currentWeatherDataState, forecastDataState)
+                                    }
+                                    Row(
+                                        Modifier.height(50.dp).fillMaxWidth().padding(bottom = 8.dp),
+                                        horizontalArrangement = Arrangement.Center
+                                    ) {
+                                        repeat(pagerState.pageCount) { iteration ->
+                                            val color = if (pagerState.currentPage == iteration) Color.Black else Color.Gray.copy(alpha = 0.5f)
+                                            Box(modifier = Modifier.padding(4.dp).clip(CircleShape).size(12.dp).background(color))
+                                        }
                                     }
                                 }
-                            }
-                        } else {
-                            Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
-                                CurrentWeatherBasicInfoView(currentWeatherDataState)
-                                Spacer(Modifier.height(16.dp))
-                                CurrentWeatherDetailedInfoView(currentWeatherDataState)
-                                Spacer(Modifier.height(16.dp))
-                                ForecastView(forecastDataState)
+                            } else {
+                                Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
+                                    CurrentWeatherBasicInfoView(currentWeatherDataState)
+                                    Spacer(Modifier.height(16.dp))
+                                    CurrentWeatherDetailedInfoView(currentWeatherDataState)
+                                    Spacer(Modifier.height(16.dp))
+                                    ForecastView(forecastDataState)
+                                }
                             }
                         }
                     }
@@ -476,7 +709,16 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
 
     @Composable
     fun WeatherPage(pageIndex: Int, currentData: CurrentWeatherUIState, forecastData: ForecastUIState) {
-        Column(modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState())) {
+        Column(modifier = Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState())) { // Ensure this Column can scroll if content overflows
+            if (currentData.isOfflineData && pageIndex == 0) {
+                Text(
+                    "Displaying offline data.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+                )
+            }
             when (pageIndex) {
                 0 -> CurrentWeatherBasicInfoView(data = currentData)
                 1 -> CurrentWeatherDetailedInfoView(data = currentData)
@@ -513,7 +755,11 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
                         ) {
                             RadioButton(
                                 selected = (selectedInterval == interval),
-                                onClick = { selectedInterval = interval }
+                                onClick = { selectedInterval = interval },
+                                colors = RadioButtonDefaults.colors(
+                                    selectedColor = Color.Black,
+                                    unselectedColor = Color.DarkGray
+                                )
                             )
                             Text(
                                 text = if (interval == 0) "Disabled" else "$interval minutes",
@@ -566,7 +812,7 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
                             ) {
                                 Text(location, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
                                 IconButton(onClick = { onDelete(location) }) {
-                                    Icon(Icons.Filled.DeleteOutline, contentDescription = "Delete $location from favorites")
+                                    Icon(Icons.Filled.DeleteOutline, contentDescription = "Delete $location from favorites", tint = Color.Black)
                                 }
                             }
                             HorizontalDivider()
@@ -583,7 +829,7 @@ class MainActivity : ComponentActivity(), WeatherDataRepo.WeatherDataObserver {
     }
 }
 
-
+// Helper functions
 fun formatTime(timestamp: Long, timezoneOffset: Int, format: String = "HH:mm"): String {
     return try {
         val sdf = SimpleDateFormat(format, Locale.getDefault())
@@ -639,6 +885,7 @@ fun getWeatherIcon(iconCode: String): ImageVector {
     }
 }
 
+// Parsing functions
 fun parseCurrentWeatherJson(json: JSONObject, unit: String): CurrentWeatherUIState {
     try {
         val coord = json.optJSONObject("coord")
@@ -654,13 +901,12 @@ fun parseCurrentWeatherJson(json: JSONObject, unit: String): CurrentWeatherUISta
         val country = sys?.optString("country", "")
         val displayName = if (country.isNullOrBlank() || locationNameFromJson.contains(country)) locationNameFromJson else "$locationNameFromJson, $country"
 
-
         return CurrentWeatherUIState(
             locationName = displayName,
             coordinates = "Lat: ${coord?.optDouble("lat", 0.0)?.format(2) ?: "N/A"}, Lon: ${coord?.optDouble("lon", 0.0)?.format(2) ?: "N/A"}",
             observationTime = formatTime(dt, timezoneOffset, "EEE, MMM dd, HH:mm"),
-            temperature = "${main?.optDouble("temp")?.roundToInt() ?: "N/A"}°$unit",
-            feelsLike = "Feels like: ${main?.optDouble("feels_like")?.roundToInt() ?: "N/A"}°$unit",
+            temperature = "${main?.optDouble("temp")?.roundToInt() ?: "N/A"}$unit",
+            feelsLike = "Feels like: ${main?.optDouble("feels_like")?.roundToInt() ?: "N/A"}$unit",
             pressure = "${main?.optInt("pressure", 0) ?: "N/A"} hPa",
             weatherCondition = weather?.optString("description", "N/A")?.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() } ?: "N/A",
             weatherIcon = getWeatherIcon(weather?.optString("icon", "") ?: ""),
@@ -679,7 +925,6 @@ fun parseCurrentWeatherJson(json: JSONObject, unit: String): CurrentWeatherUISta
     }
 }
 fun Double.format(digits: Int) = "%.${digits}f".format(this)
-
 
 fun parseForecastJson(json: JSONObject, unit: String): ForecastUIState {
     val dailyForecasts = mutableListOf<DailyForecastItem>()
@@ -701,7 +946,6 @@ fun parseForecastJson(json: JSONObject, unit: String): ForecastUIState {
             try { SimpleDateFormat("MMM dd", Locale.getDefault()).parse(it) } catch (e: Exception) { Date(0) }
         })
 
-
         for (dateKey in sortedDates.take(5)) {
             val dayEntries = dailyData[dateKey] ?: continue
             if (dayEntries.isEmpty()) continue
@@ -718,24 +962,20 @@ fun parseForecastJson(json: JSONObject, unit: String): ForecastUIState {
                 val weather = entry.optJSONArray("weather")?.optJSONObject(0)
                 val condition = weather?.optString("description") ?: "N/A"
                 conditionCounts[condition] = (conditionCounts[condition] ?: 0) + 1
-
             }
             val representativeCondition = conditionCounts.maxByOrNull { it.value }?.key ?: dayEntries.first().optJSONArray("weather")?.optJSONObject(0)?.optString("description") ?: "N/A"
-
             val middayEntry = dayEntries.find { entry ->
                 val hour = formatTime(entry.optLong("dt"), timezoneOffset, "HH").toIntOrNull()
                 hour in 11..15
             } ?: dayEntries.first()
-
             dominantIconCode = middayEntry.optJSONArray("weather")?.optJSONObject(0)?.optString("icon") ?: dominantIconCode
-
 
             dailyForecasts.add(
                 DailyForecastItem(
                     date = dateKey,
                     dayOfWeek = formatDayOfWeek(dayEntries.first().optLong("dt"), timezoneOffset),
-                    tempMin = "${minTemp.roundToInt()}°$unit",
-                    tempMax = "${maxTemp.roundToInt()}°$unit",
+                    tempMin = "${minTemp.roundToInt()}$unit",
+                    tempMax = "${maxTemp.roundToInt()}$unit",
                     condition = representativeCondition.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() },
                     icon = getWeatherIcon(dominantIconCode)
                 )
@@ -748,20 +988,35 @@ fun parseForecastJson(json: JSONObject, unit: String): ForecastUIState {
     }
 }
 
+// Composable Views
 @Composable
 fun CurrentWeatherBasicInfoView(data: CurrentWeatherUIState) {
     DataCard(title = "Current Weather - ${data.locationName}") {
         if (data.isLoading && data.error == null) {
             CircularProgressIndicator(modifier = Modifier.align(Alignment.CenterHorizontally))
-        } else if (data.error != null && data.locationName == "N/A") {
+        } else if (data.error != null && (data.locationName == "N/A" || (!data.isOfflineData))) {
             Text("Error: ${data.error}", color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
         }
         else {
-            if (data.error != null) {
+            if (data.error != null && data.isOfflineData) {
                 Text("Error: ${data.error}", color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp))
             }
+            if (data.isOfflineData && data.error == null) {
+                Text(
+                    "Offline data (last sync: ${data.observationTime.replace("Offline: ", "")})",
+                    style = MaterialTheme.typography.labelMedium,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                Icon(imageVector = data.weatherIcon, contentDescription = data.weatherCondition, modifier = Modifier.size(80.dp).padding(end = 16.dp), tint = MaterialTheme.colorScheme.primary)
+                Icon(
+                    imageVector = data.weatherIcon,
+                    contentDescription = data.weatherCondition,
+                    modifier = Modifier.size(80.dp).padding(end = 16.dp),
+                    tint = Color.Black
+                )
                 Column(modifier = Modifier.weight(1f)) {
                     Text(data.temperature, style = MaterialTheme.typography.displaySmall, fontWeight = FontWeight.Bold)
                     Text(data.weatherCondition, style = MaterialTheme.typography.titleMedium)
@@ -769,7 +1024,7 @@ fun CurrentWeatherBasicInfoView(data: CurrentWeatherUIState) {
                 }
             }
             Spacer(Modifier.height(16.dp))
-            InfoRow("Time:", data.observationTime)
+            InfoRow("Observation Time:", if (data.isOfflineData) data.observationTime.replace("Offline: ", "") else data.observationTime)
             InfoRow("Coordinates:", data.coordinates)
             InfoRow("Pressure:", data.pressure)
             InfoRow("Sunrise:", data.sunrise)
@@ -783,11 +1038,11 @@ fun CurrentWeatherDetailedInfoView(data: CurrentWeatherUIState) {
     DataCard(title = "Additional Details") {
         if (data.isLoading && data.error == null) {
             CircularProgressIndicator(modifier = Modifier.align(Alignment.CenterHorizontally))
-        } else if (data.error != null && data.humidity == "N/A") {
+        } else if (data.error != null && (data.humidity == "N/A" || (!data.isOfflineData && data.error != null))) {
             Text("Error: ${data.error}", color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
         }
         else {
-            if (data.error != null) {
+            if (data.error != null && data.isOfflineData) {
                 Text("Error fetching full details: ${data.error}", color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp))
             }
             InfoRow("Wind:", "${data.windSpeed}, ${data.windDirection}")
@@ -807,6 +1062,15 @@ fun ForecastView(data: ForecastUIState) {
         } else if (data.dailyForecasts.isEmpty()){
             Text("No forecast data available.", textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
         } else {
+            if (data.isOfflineData) {
+                Text(
+                    "Offline forecast.",
+                    style = MaterialTheme.typography.labelMedium,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
             Column {
                 data.dailyForecasts.forEachIndexed { index, item ->
                     ForecastItemRow(item)
@@ -826,7 +1090,12 @@ fun ForecastItemRow(item: DailyForecastItem) {
             Text(item.dayOfWeek, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
             Text(item.date, style = MaterialTheme.typography.bodySmall)
         }
-        Icon(item.icon, item.condition, Modifier.size(40.dp).padding(horizontal = 8.dp), tint = MaterialTheme.colorScheme.primary)
+        Icon(
+            imageVector = item.icon,
+            contentDescription = item.condition,
+            Modifier.size(40.dp).padding(horizontal = 8.dp),
+            tint = Color.Black
+        )
         Column(Modifier.weight(1.5f), horizontalAlignment = Alignment.Start) { Text(item.condition, style = MaterialTheme.typography.bodyMedium) }
         Column(Modifier.weight(1f), horizontalAlignment = Alignment.End) { Text("${item.tempMax} / ${item.tempMin}", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium) }
     }
@@ -846,7 +1115,7 @@ fun DataCard(title: String, modifier: Modifier = Modifier, content: @Composable 
 @Composable
 fun InfoRow(label: String, value: String, icon: ImageVector? = null) {
     Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-        icon?.let { Icon(it, label, Modifier.size(20.dp).padding(end = 8.dp), tint = MaterialTheme.colorScheme.secondary) }
+        icon?.let { Icon(it, label, Modifier.size(20.dp).padding(end = 8.dp), tint = Color.Black) }
         Text("$label ", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Text(value, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
     }
