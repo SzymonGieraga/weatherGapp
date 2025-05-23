@@ -133,10 +133,8 @@ class apiServices(private val context: Context) {
 
     private fun sanitizeFilename(location: String): String {
         return try {
-            // Replace non-alphanumeric characters (except comma, hyphen, underscore) with underscore, then URL encode
             URLEncoder.encode(location.replace(Regex("[^a-zA-Z0-9,-_]"), "_"), StandardCharsets.UTF_8.name())
         } catch (e: Exception) {
-            // Fallback if encoding fails (should be rare)
             location.replace(Regex("[^a-zA-Z0-9,-_]"), "_")
         }
     }
@@ -249,7 +247,7 @@ class apiServices(private val context: Context) {
             } else {
                 mutableListOf()
             }
-        } catch (e: Exception) { // Catch broader exceptions for deserialization issues
+        } catch (e: Exception) {
             Log.e("apiServices", "Error loading favorites", e)
             mutableListOf()
         }
